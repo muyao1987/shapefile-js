@@ -1,5 +1,5 @@
 {
-  "name": "shpjs",
+  "name": "@mars3d/shpjs",
   "version": "4.1.0",
   "description": "A binary shapefile loader, for javascript. Not many caveats",
   "main": "lib/index.js",
