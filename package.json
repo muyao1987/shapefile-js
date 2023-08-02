@@ -12,7 +12,8 @@
     "build-test": "browserify ./test/test.js > ./test/bundle.js",
     "build": "browserify . -s shp > ./dist/shp.js",
     "min": "browserify . -s shp | minify > ./dist/shp.min.js",
-    "serve": "node test/server.js"
+    "serve": "node test/server.js",
+    "push": "npm publish --registry=https://registry.npmjs.org"
   },
   "author": "Calvin Metcalf",
   "license": "MIT",
