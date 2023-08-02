@@ -2811,8 +2811,13 @@ const AC = hasAbortController
       constructor() {
         this.signal = new AS()
       }
-      abort() {
-        this.signal.dispatchEvent('abort')
+      abort(reason = new Error('This operation was aborted')) {
+        this.signal.reason = this.signal.reason || reason
+        this.signal.aborted = true
+        this.signal.dispatchEvent({
+          type: 'abort',
+          target: this.signal,
+        })
       }
     }
 
@@ -2825,13 +2830,13 @@ const AS = hasAbortSignal
   ? AC.AbortController
   : class AbortSignal {
       constructor() {
+        this.reason = undefined
         this.aborted = false
         this._listeners = []
       }
-      dispatchEvent(type) {
-        if (type === 'abort') {
+      dispatchEvent(e) {
+        if (e.type === 'abort') {
           this.aborted = true
-          const e = { type, target: this }
           this.onabort(e)
           this._listeners.forEach(f => f(e), this)
         }
@@ -2957,6 +2962,9 @@ class LRUCache {
       fetchContext,
       noDeleteOnFetchRejection,
       noDeleteOnStaleGet,
+      allowStaleOnFetchRejection,
+      allowStaleOnFetchAbort,
+      ignoreFetchAbort,
     } = options
 
     // deprecated options, don't trigger a warning for getting them if
@@ -3026,6 +3034,9 @@ class LRUCache {
     this.noDisposeOnSet = !!noDisposeOnSet
     this.noUpdateTTL = !!noUpdateTTL
     this.noDeleteOnFetchRejection = !!noDeleteOnFetchRejection
+    this.allowStaleOnFetchRejection = !!allowStaleOnFetchRejection
+    this.allowStaleOnFetchAbort = !!allowStaleOnFetchAbort
+    this.ignoreFetchAbort = !!ignoreFetchAbort
 
     // NB: maxEntrySize is set to maxSize if it's set
     if (this.maxEntrySize !== 0) {
@@ -3119,6 +3130,15 @@ class LRUCache {
       this.starts[index] = this.ttls[index] !== 0 ? perf.now() : 0
     }
 
+    this.statusTTL = (status, index) => {
+      if (status) {
+        status.ttl = this.ttls[index]
+        status.start = this.starts[index]
+        status.now = cachedNow || getNow()
+        status.remainingTTL = status.now + status.ttl - status.start
+      }
+    }
+
     // debounce calls to perf.now() to 1s so we're not hitting
     // that costly call repeatedly.
     let cachedNow = 0
@@ -3159,9 +3179,10 @@ class LRUCache {
       )
     }
   }
-  updateItemAge(index) {}
-  setItemTTL(index, ttl, start) {}
-  isStale(index) {
+  updateItemAge(_index) {}
+  statusTTL(_status, _index) {}
+  setItemTTL(_index, _ttl, _start) {}
+  isStale(_index) {
     return false
   }
 
@@ -3191,13 +3212,15 @@ class LRUCache {
           }
         } else {
           throw new TypeError(
-            'invalid size value (must be positive integer)'
+            'invalid size value (must be positive integer). ' +
+              'When maxSize or maxEntrySize is used, sizeCalculation or size ' +
+              'must be set.'
           )
         }
       }
       return size
     }
-    this.addItemSize = (index, size) => {
+    this.addItemSize = (index, size, status) => {
       this.sizes[index] = size
       if (this.maxSize) {
         const maxSize = this.maxSize - this.sizes[index]
@@ -3206,11 +3229,15 @@ class LRUCache {
         }
       }
       this.calculatedSize += this.sizes[index]
+      if (status) {
+        status.entrySize = size
+        status.totalCalculatedSize = this.calculatedSize
+      }
     }
   }
-  removeItemSize(index) {}
-  addItemSize(index, size) {}
-  requireSize(k, v, size, sizeCalculation) {
+  removeItemSize(_index) {}
+  addItemSize(_index, _size) {}
+  requireSize(_k, _v, size, sizeCalculation) {
     if (size || sizeCalculation) {
       throw new TypeError(
         'cannot set size without setting maxSize or maxEntrySize on cache'
@@ -3255,39 +3282,74 @@ class LRUCache {
   }
 
   isValidIndex(index) {
-    return this.keyMap.get(this.keyList[index]) === index
+    return (
+      index !== undefined &&
+      this.keyMap.get(this.keyList[index]) === index
+    )
   }
 
   *entries() {
     for (const i of this.indexes()) {
-      yield [this.keyList[i], this.valList[i]]
+      if (
+        this.valList[i] !== undefined &&
+        this.keyList[i] !== undefined &&
+        !this.isBackgroundFetch(this.valList[i])
+      ) {
+        yield [this.keyList[i], this.valList[i]]
+      }
     }
   }
   *rentries() {
     for (const i of this.rindexes()) {
-      yield [this.keyList[i], this.valList[i]]
+      if (
+        this.valList[i] !== undefined &&
+        this.keyList[i] !== undefined &&
+        !this.isBackgroundFetch(this.valList[i])
+      ) {
+        yield [this.keyList[i], this.valList[i]]
+      }
     }
   }
 
   *keys() {
     for (const i of this.indexes()) {
-      yield this.keyList[i]
+      if (
+        this.keyList[i] !== undefined &&
+        !this.isBackgroundFetch(this.valList[i])
+      ) {
+        yield this.keyList[i]
+      }
     }
   }
   *rkeys() {
     for (const i of this.rindexes()) {
-      yield this.keyList[i]
+      if (
+        this.keyList[i] !== undefined &&
+        !this.isBackgroundFetch(this.valList[i])
+      ) {
+        yield this.keyList[i]
+      }
     }
   }
 
   *values() {
     for (const i of this.indexes()) {
-      yield this.valList[i]
+      if (
+        this.valList[i] !== undefined &&
+        !this.isBackgroundFetch(this.valList[i])
+      ) {
+        yield this.valList[i]
+      }
     }
   }
   *rvalues() {
     for (const i of this.rindexes()) {
-      yield this.valList[i]
+      if (
+        this.valList[i] !== undefined &&
+        !this.isBackgroundFetch(this.valList[i])
+      ) {
+        yield this.valList[i]
+      }
     }
   }
 
@@ -3295,9 +3357,14 @@ class LRUCache {
     return this.entries()
   }
 
-  find(fn, getOptions = {}) {
+  find(fn, getOptions) {
     for (const i of this.indexes()) {
-      if (fn(this.valList[i], this.keyList[i], this)) {
+      const v = this.valList[i]
+      const value = this.isBackgroundFetch(v)
+        ? v.__staleWhileFetching
+        : v
+      if (value === undefined) continue
+      if (fn(value, this.keyList[i], this)) {
         return this.get(this.keyList[i], getOptions)
       }
     }
@@ -3305,13 +3372,23 @@ class LRUCache {
 
   forEach(fn, thisp = this) {
     for (const i of this.indexes()) {
-      fn.call(thisp, this.valList[i], this.keyList[i], this)
+      const v = this.valList[i]
+      const value = this.isBackgroundFetch(v)
+        ? v.__staleWhileFetching
+        : v
+      if (value === undefined) continue
+      fn.call(thisp, value, this.keyList[i], this)
     }
   }
 
   rforEach(fn, thisp = this) {
     for (const i of this.rindexes()) {
-      fn.call(thisp, this.valList[i], this.keyList[i], this)
+      const v = this.valList[i]
+      const value = this.isBackgroundFetch(v)
+        ? v.__staleWhileFetching
+        : v
+      if (value === undefined) continue
+      fn.call(thisp, value, this.keyList[i], this)
     }
   }
 
@@ -3339,6 +3416,7 @@ class LRUCache {
       const value = this.isBackgroundFetch(v)
         ? v.__staleWhileFetching
         : v
+      if (value === undefined) continue
       const entry = { value }
       if (this.ttls) {
         entry.ttl = this.ttls[i]
@@ -3369,7 +3447,7 @@ class LRUCache {
     }
   }
 
-  dispose(v, k, reason) {}
+  dispose(_v, _k, _reason) {}
 
   set(
     k,
@@ -3381,12 +3459,17 @@ class LRUCache {
       size = 0,
       sizeCalculation = this.sizeCalculation,
       noUpdateTTL = this.noUpdateTTL,
+      status,
     } = {}
   ) {
     size = this.requireSize(k, v, size, sizeCalculation)
     // if the item doesn't fit, don't do anything
     // NB: maxEntrySize set to maxSize by default
     if (this.maxEntrySize && size > this.maxEntrySize) {
+      if (status) {
+        status.set = 'miss'
+        status.maxEntrySizeExceeded = true
+      }
       // have to delete, in case a background fetch is there already.
       // in non-async cases, this is a no-op
       this.delete(k)
@@ -3403,14 +3486,18 @@ class LRUCache {
       this.prev[index] = this.tail
       this.tail = index
       this.size++
-      this.addItemSize(index, size)
+      this.addItemSize(index, size, status)
+      if (status) {
+        status.set = 'add'
+      }
       noUpdateTTL = false
     } else {
       // update
+      this.moveToTail(index)
       const oldVal = this.valList[index]
       if (v !== oldVal) {
         if (this.isBackgroundFetch(oldVal)) {
-          oldVal.__abortController.abort()
+          oldVal.__abortController.abort(new Error('replaced'))
         } else {
           if (!noDisposeOnSet) {
             this.dispose(oldVal, k, 'set')
@@ -3421,9 +3508,18 @@ class LRUCache {
         }
         this.removeItemSize(index)
         this.valList[index] = v
-        this.addItemSize(index, size)
+        this.addItemSize(index, size, status)
+        if (status) {
+          status.set = 'replace'
+          const oldValue =
+            oldVal && this.isBackgroundFetch(oldVal)
+              ? oldVal.__staleWhileFetching
+              : oldVal
+          if (oldValue !== undefined) status.oldValue = oldValue
+        }
+      } else if (status) {
+        status.set = 'update'
       }
-      this.moveToTail(index)
     }
     if (ttl !== 0 && this.ttl === 0 && !this.ttls) {
       this.initializeTTLTracking()
@@ -3431,6 +3527,7 @@ class LRUCache {
     if (!noUpdateTTL) {
       this.setItemTTL(index, ttl, start)
     }
+    this.statusTTL(status, index)
     if (this.disposeAfter) {
       while (this.disposed.length) {
         this.disposeAfter(...this.disposed.shift())
@@ -3466,7 +3563,7 @@ class LRUCache {
     const k = this.keyList[head]
     const v = this.valList[head]
     if (this.isBackgroundFetch(v)) {
-      v.__abortController.abort()
+      v.__abortController.abort(new Error('evicted'))
     } else {
       this.dispose(v, k, 'evict')
       if (this.disposeAfter) {
@@ -3486,15 +3583,22 @@ class LRUCache {
     return head
   }
 
-  has(k, { updateAgeOnHas = this.updateAgeOnHas } = {}) {
+  has(k, { updateAgeOnHas = this.updateAgeOnHas, status } = {}) {
     const index = this.keyMap.get(k)
     if (index !== undefined) {
       if (!this.isStale(index)) {
         if (updateAgeOnHas) {
           this.updateItemAge(index)
         }
+        if (status) status.has = 'hit'
+        this.statusTTL(status, index)
         return true
+      } else if (status) {
+        status.has = 'stale'
+        this.statusTTL(status, index)
       }
+    } else if (status) {
+      status.has = 'miss'
     }
     return false
   }
@@ -3515,41 +3619,109 @@ class LRUCache {
       return v
     }
     const ac = new AC()
+    if (options.signal) {
+      options.signal.addEventListener('abort', () =>
+        ac.abort(options.signal.reason)
+      )
+    }
     const fetchOpts = {
       signal: ac.signal,
       options,
       context,
     }
-    const cb = v => {
-      if (!ac.signal.aborted) {
-        this.set(k, v, fetchOpts.options)
+    const cb = (v, updateCache = false) => {
+      const { aborted } = ac.signal
+      const ignoreAbort = options.ignoreFetchAbort && v !== undefined
+      if (options.status) {
+        if (aborted && !updateCache) {
+          options.status.fetchAborted = true
+          options.status.fetchError = ac.signal.reason
+          if (ignoreAbort) options.status.fetchAbortIgnored = true
+        } else {
+          options.status.fetchResolved = true
+        }
+      }
+      if (aborted && !ignoreAbort && !updateCache) {
+        return fetchFail(ac.signal.reason)
+      }
+      // either we didn't abort, and are still here, or we did, and ignored
+      if (this.valList[index] === p) {
+        if (v === undefined) {
+          if (p.__staleWhileFetching) {
+            this.valList[index] = p.__staleWhileFetching
+          } else {
+            this.delete(k)
+          }
+        } else {
+          if (options.status) options.status.fetchUpdated = true
+          this.set(k, v, fetchOpts.options)
+        }
       }
       return v
     }
     const eb = er => {
+      if (options.status) {
+        options.status.fetchRejected = true
+        options.status.fetchError = er
+      }
+      return fetchFail(er)
+    }
+    const fetchFail = er => {
+      const { aborted } = ac.signal
+      const allowStaleAborted =
+        aborted && options.allowStaleOnFetchAbort
+      const allowStale =
+        allowStaleAborted || options.allowStaleOnFetchRejection
+      const noDelete = allowStale || options.noDeleteOnFetchRejection
       if (this.valList[index] === p) {
-        const del =
-          !options.noDeleteOnFetchRejection ||
-          p.__staleWhileFetching === undefined
+        // if we allow stale on fetch rejections, then we need to ensure that
+        // the stale value is not removed from the cache when the fetch fails.
+        const del = !noDelete || p.__staleWhileFetching === undefined
         if (del) {
           this.delete(k)
-        } else {
+        } else if (!allowStaleAborted) {
           // still replace the *promise* with the stale value,
           // since we are done with the promise at this point.
+          // leave it untouched if we're still waiting for an
+          // aborted background fetch that hasn't yet returned.
           this.valList[index] = p.__staleWhileFetching
         }
       }
-      if (p.__returned === p) {
+      if (allowStale) {
+        if (options.status && p.__staleWhileFetching !== undefined) {
+          options.status.returnedStale = true
+        }
+        return p.__staleWhileFetching
+      } else if (p.__returned === p) {
         throw er
       }
     }
-    const pcall = res => res(this.fetchMethod(k, v, fetchOpts))
+    const pcall = (res, rej) => {
+      this.fetchMethod(k, v, fetchOpts).then(v => res(v), rej)
+      // ignored, we go until we finish, regardless.
+      // defer check until we are actually aborting,
+      // so fetchMethod can override.
+      ac.signal.addEventListener('abort', () => {
+        if (
+          !options.ignoreFetchAbort ||
+          options.allowStaleOnFetchAbort
+        ) {
+          res()
+          // when it eventually resolves, update the cache.
+          if (options.allowStaleOnFetchAbort) {
+            res = v => cb(v, true)
+          }
+        }
+      })
+    }
+    if (options.status) options.status.fetchDispatched = true
     const p = new Promise(pcall).then(cb, eb)
     p.__abortController = ac
     p.__staleWhileFetching = v
     p.__returned = null
     if (index === undefined) {
-      this.set(k, p, fetchOpts.options)
+      // internal, don't expose status.
+      this.set(k, p, { ...fetchOpts.options, status: undefined })
       index = this.keyMap.get(k)
     } else {
       this.valList[index] = p
@@ -3587,15 +3759,22 @@ class LRUCache {
       noUpdateTTL = this.noUpdateTTL,
       // fetch exclusive options
       noDeleteOnFetchRejection = this.noDeleteOnFetchRejection,
+      allowStaleOnFetchRejection = this.allowStaleOnFetchRejection,
+      ignoreFetchAbort = this.ignoreFetchAbort,
+      allowStaleOnFetchAbort = this.allowStaleOnFetchAbort,
       fetchContext = this.fetchContext,
       forceRefresh = false,
+      status,
+      signal,
     } = {}
   ) {
     if (!this.fetchMethod) {
+      if (status) status.fetch = 'get'
       return this.get(k, {
         allowStale,
         updateAgeOnGet,
         noDeleteOnStaleGet,
+        status,
       })
     }
 
@@ -3609,37 +3788,54 @@ class LRUCache {
       sizeCalculation,
       noUpdateTTL,
       noDeleteOnFetchRejection,
+      allowStaleOnFetchRejection,
+      allowStaleOnFetchAbort,
+      ignoreFetchAbort,
+      status,
+      signal,
     }
 
     let index = this.keyMap.get(k)
     if (index === undefined) {
+      if (status) status.fetch = 'miss'
       const p = this.backgroundFetch(k, index, options, fetchContext)
       return (p.__returned = p)
     } else {
       // in cache, maybe already fetching
       const v = this.valList[index]
       if (this.isBackgroundFetch(v)) {
-        return allowStale && v.__staleWhileFetching !== undefined
-          ? v.__staleWhileFetching
-          : (v.__returned = v)
+        const stale =
+          allowStale && v.__staleWhileFetching !== undefined
+        if (status) {
+          status.fetch = 'inflight'
+          if (stale) status.returnedStale = true
+        }
+        return stale ? v.__staleWhileFetching : (v.__returned = v)
       }
 
       // if we force a refresh, that means do NOT serve the cached value,
       // unless we are already in the process of refreshing the cache.
-      if (!forceRefresh && !this.isStale(index)) {
+      const isStale = this.isStale(index)
+      if (!forceRefresh && !isStale) {
+        if (status) status.fetch = 'hit'
         this.moveToTail(index)
         if (updateAgeOnGet) {
           this.updateItemAge(index)
         }
+        this.statusTTL(status, index)
         return v
       }
 
       // ok, it is stale or a forced refresh, and not already fetching.
       // refresh the cache.
       const p = this.backgroundFetch(k, index, options, fetchContext)
-      return allowStale && p.__staleWhileFetching !== undefined
-        ? p.__staleWhileFetching
-        : (p.__returned = p)
+      const hasStale = p.__staleWhileFetching !== undefined
+      const staleVal = hasStale && allowStale
+      if (status) {
+        status.fetch = hasStale && isStale ? 'stale' : 'refresh'
+        if (staleVal && isStale) status.returnedStale = true
+      }
+      return staleVal ? p.__staleWhileFetching : (p.__returned = p)
     }
   }
 
@@ -3649,28 +3845,39 @@ class LRUCache {
       allowStale = this.allowStale,
       updateAgeOnGet = this.updateAgeOnGet,
       noDeleteOnStaleGet = this.noDeleteOnStaleGet,
+      status,
     } = {}
   ) {
     const index = this.keyMap.get(k)
     if (index !== undefined) {
       const value = this.valList[index]
       const fetching = this.isBackgroundFetch(value)
+      this.statusTTL(status, index)
       if (this.isStale(index)) {
+        if (status) status.get = 'stale'
         // delete only if not an in-flight background fetch
         if (!fetching) {
           if (!noDeleteOnStaleGet) {
             this.delete(k)
           }
+          if (status) status.returnedStale = allowStale
           return allowStale ? value : undefined
         } else {
+          if (status) {
+            status.returnedStale =
+              allowStale && value.__staleWhileFetching !== undefined
+          }
           return allowStale ? value.__staleWhileFetching : undefined
         }
       } else {
+        if (status) status.get = 'hit'
         // if we're currently fetching it, we don't actually have it yet
-        // it's not stale, which means this isn't a staleWhileRefetching,
-        // so we just return undefined
+        // it's not stale, which means this isn't a staleWhileRefetching.
+        // If it's not stale, and fetching, AND has a __staleWhileFetching
+        // value, then that means the user fetched with {forceRefresh:true},
+        // so it's safe to return that value.
         if (fetching) {
-          return undefined
+          return value.__staleWhileFetching
         }
         this.moveToTail(index)
         if (updateAgeOnGet) {
@@ -3678,6 +3885,8 @@ class LRUCache {
         }
         return value
       }
+    } else if (status) {
+      status.get = 'miss'
     }
   }
 
@@ -3723,7 +3932,7 @@ class LRUCache {
           this.removeItemSize(index)
           const v = this.valList[index]
           if (this.isBackgroundFetch(v)) {
-            v.__abortController.abort()
+            v.__abortController.abort(new Error('deleted'))
           } else {
             this.dispose(v, k, 'delete')
             if (this.disposeAfter) {
@@ -3758,7 +3967,7 @@ class LRUCache {
     for (const index of this.rindexes({ allowStale: true })) {
       const v = this.valList[index]
       if (this.isBackgroundFetch(v)) {
-        v.__abortController.abort()
+        v.__abortController.abort(new Error('deleted'))
       } else {
         const k = this.keyList[index]
         this.dispose(v, k, 'delete')
@@ -4346,7 +4555,7 @@ process.umask = function() { return 0; };
     var ENDED = -1;
     var whitespace = /\s/;
     var latin = /[A-Za-z]/;
-    var keyword = /[A-Za-z84]/;
+    var keyword = /[A-Za-z84_]/;
     var endThings = /[,\]]/;
     var digets = /[\d\.E\-\+]/;
     // const ignoredChar = /[\s_\-\/\(\)]/g;
@@ -5210,6 +5419,13 @@ process.umask = function() { return 0; };
       a: 6378249.145,
       rf: 293.4663,
       ellipseName: "Clarke 1880 mod."
+    };
+
+    exports$2.clrk80ign = {
+      a: 6378249.2,
+      b: 6356515,
+      rf: 293.4660213,
+      ellipseName: "Clarke 1880 (IGN)"
     };
 
     exports$2.clrk58 = {
@@ -6289,14 +6505,25 @@ process.umask = function() { return 0; };
     }
 
     function checkNotWGS(source, dest) {
-      return ((source.datum.datum_type === PJD_3PARAM || source.datum.datum_type === PJD_7PARAM) && dest.datumCode !== 'WGS84') || ((dest.datum.datum_type === PJD_3PARAM || dest.datum.datum_type === PJD_7PARAM) && source.datumCode !== 'WGS84');
+      return (
+        (source.datum.datum_type === PJD_3PARAM || source.datum.datum_type === PJD_7PARAM || source.datum.datum_type === PJD_GRIDSHIFT) && dest.datumCode !== 'WGS84') ||
+        ((dest.datum.datum_type === PJD_3PARAM || dest.datum.datum_type === PJD_7PARAM || dest.datum.datum_type === PJD_GRIDSHIFT) && source.datumCode !== 'WGS84');
     }
 
     function transform(source, dest, point, enforceAxis) {
       var wgs84;
       if (Array.isArray(point)) {
         point = toPoint(point);
+      } else {
+        // Clone the point object so inputs don't get modified
+        point = {
+          x: point.x,
+          y: point.y,
+          z: point.z,
+          m: point.m
+        };
       }
+      var hasZ = point.z !== undefined;
       checkSanity(point);
       // Workaround for datum shifts towgs84, if either source or destination projection is not wgs84
       if (source.datum && dest.datum && checkNotWGS(source, dest)) {
@@ -6371,6 +6598,9 @@ process.umask = function() { return 0; };
         return adjust_axis(dest, true, point);
       }
 
+      if (!hasZ) {
+        delete point.z;
+      }
       return point;
     }
 
@@ -9073,18 +9303,18 @@ process.umask = function() { return 0; };
       this.t1 = this.sin_po;
       this.con = this.sin_po;
       this.ms1 = msfnz(this.e3, this.sin_po, this.cos_po);
-      this.qs1 = qsfnz(this.e3, this.sin_po, this.cos_po);
+      this.qs1 = qsfnz(this.e3, this.sin_po);
 
       this.sin_po = Math.sin(this.lat2);
       this.cos_po = Math.cos(this.lat2);
       this.t2 = this.sin_po;
       this.ms2 = msfnz(this.e3, this.sin_po, this.cos_po);
-      this.qs2 = qsfnz(this.e3, this.sin_po, this.cos_po);
+      this.qs2 = qsfnz(this.e3, this.sin_po);
 
       this.sin_po = Math.sin(this.lat0);
       this.cos_po = Math.cos(this.lat0);
       this.t3 = this.sin_po;
-      this.qs0 = qsfnz(this.e3, this.sin_po, this.cos_po);
+      this.qs0 = qsfnz(this.e3, this.sin_po);
 
       if (Math.abs(this.lat1 - this.lat2) > EPSLN) {
         this.ns0 = (this.ms1 * this.ms1 - this.ms2 * this.ms2) / (this.qs2 - this.qs1);
@@ -9106,7 +9336,7 @@ process.umask = function() { return 0; };
       this.sin_phi = Math.sin(lat);
       this.cos_phi = Math.cos(lat);
 
-      var qs = qsfnz(this.e3, this.sin_phi, this.cos_phi);
+      var qs = qsfnz(this.e3, this.sin_phi);
       var rh1 = this.a * Math.sqrt(this.c - this.ns0 * qs) / this.ns0;
       var theta = this.ns0 * adjust_lon(lon - this.long0);
       var x = rh1 * Math.sin(theta) + this.x0;
@@ -11443,7 +11673,7 @@ process.umask = function() { return 0; };
     proj4$1.nadgrid = nadgrid;
     proj4$1.transform = transform;
     proj4$1.mgrs = mgrs;
-    proj4$1.version = '2.8.0';
+    proj4$1.version = '2.9.0';
     includedProjections(proj4$1);
 
     return proj4$1;
@@ -15220,6 +15450,10 @@ let proj4 = require("proj4");
 if (proj4.default) {
   proj4 = proj4.default;
 }
+if (window.proj4) {
+  proj4 = window.proj4;
+}
+
 const unzip = require("./unzip");
 const binaryAjax = require("./binaryajax");
 const parseShp = require("./parseShp");
@@ -15258,11 +15492,11 @@ function isArrayBuffer(subject) {
   );
 }
 
-function shp(base, whiteList, encoding) {
+function shp(base, whiteList, encoding, crs) {
   if (typeof base === "string" && cache.has(base)) {
     return Promise.resolve(cache.get(base));
   }
-  return shp.getShapefile(base, whiteList, encoding).then(function (resp) {
+  return shp.getShapefile(base, whiteList, encoding, crs).then(function (resp) {
     if (typeof base === "string") {
       cache.set(base, resp);
     }
@@ -15288,7 +15522,7 @@ shp.combine = function ([shp, dbf]) {
   }
   return out;
 };
-shp.parseZip = async function (buffer, whiteList, encoding) {
+shp.parseZip = async function (buffer, whiteList, encoding, crs) {
   let key;
   buffer = toBuffer(buffer);
   const zip = await unzip(buffer);
@@ -15302,7 +15536,14 @@ shp.parseZip = async function (buffer, whiteList, encoding) {
       names.push(key.slice(0, -4));
       zip[key.slice(0, -3) + key.slice(-3).toLowerCase()] = zip[key];
     } else if (key.slice(-3).toLowerCase() === "prj") {
-      zip[key.slice(0, -3) + key.slice(-3).toLowerCase()] = proj4(zip[key]);
+      let nowProj;
+      try {
+        nowProj = proj4(crs || zip[key]);
+      } catch (e) {
+        console.error("该坐标系proj4无法解析", e);
+        nowProj = proj4("EPSG:4326");
+      }
+      zip[key.slice(0, -3) + key.slice(-3).toLowerCase()] = nowProj;
     } else if (
       key.slice(-4).toLowerCase() === "json" ||
       whiteList.indexOf(key.split(".").pop()) > -1
@@ -15346,9 +15587,9 @@ shp.parseZip = async function (buffer, whiteList, encoding) {
   }
 };
 
-async function getZip(base, whiteList, encoding) {
+async function getZip(base, whiteList, encoding, crs) {
   const a = await binaryAjax(base);
-  return shp.parseZip(a, whiteList, encoding);
+  return shp.parseZip(a, whiteList, encoding, crs);
 }
 const handleShp = async (base) => {
   const args = await Promise.all([
@@ -15376,15 +15617,16 @@ const handleDbf = async (base) => {
   return parseDbf(dbf, cpg);
 };
 const checkSuffix = (base, suffix) => {
-  const url = new URL(base);
-  return url.pathname.slice(-4).toLowerCase() === suffix;
+  return base.toLowerCase().endsWith(suffix);
+  // const url = new URL(base);
+  // return url.pathname.slice(-4).toLowerCase() === suffix;
 };
-shp.getShapefile = async function (base, whiteList, encoding) {
+shp.getShapefile = async function (base, whiteList, encoding, crs) {
   if (typeof base !== "string") {
-    return shp.parseZip(base, whiteList, encoding);
+    return shp.parseZip(base, whiteList, encoding, crs);
   }
   if (checkSuffix(base, ".zip")) {
-    return getZip(base, whiteList, encoding);
+    return getZip(base, whiteList, encoding, crs);
   }
   const results = await Promise.all([handleShp(base), handleDbf(base)]);
   return shp.combine(results);
